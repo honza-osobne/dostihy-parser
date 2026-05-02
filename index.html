@@ -156,21 +156,18 @@
 
         class RaceResultParser {
             constructor(rawText) {
-                // Normalizace: mřížky a zalomení řádků nahradíme mezerou pro snazší hledání statistik
+                // Normalizace: mřížky a zalomení řádků nahradíme mezerou
                 this.normalizedText = rawText.replace(/[#\r\n]+/g, ' ').replace(/\s+/g, ' ');
             }
 
             parse() {
-                // Extrakce data a místa z hlavičky (např. "VÝSLEDKOVÁ LISTINA - 12.4.2025 Hipodrom Bravantice")
                 const headerInfo = this.extractHeaderData(this.normalizedText);
-
                 const results = {
                     datum: headerInfo.datum,
                     misto: headerInfo.misto,
                     dostihy: []
                 };
 
-                // Rozdělení na dostihy podle klíčového slova
                 const raceBlocks = this.normalizedText.split(/(?=\d+\.\s*dostih)/);
                 raceBlocks.forEach(block => {
                     if (block.includes("dostih")) {
@@ -182,13 +179,8 @@
             }
 
             extractHeaderData(text) {
-                // Hledá datum ve formátu DD.MM.YYYY nebo D.M.YYYY
                 const dateMatch = text.match(/(\d{1,2}\.\s*\d{1,2}\.\s*\d{4})/);
-
-                // Hledá místo - obvykle text za datem nebo za pomlčkou v úvodu
-                // Bere v úvahu formáty "12.4.2025 Hipodrom Bravantice" nebo "09.08.2025 Bravantice"
                 const locationMatch = text.match(/(?:\d{4})\s+([A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ][a-záčďéěíňóřšťúůýž]+(?:\s+[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ][a-záčďéěíňóřšťúůýž]+)*)/);
-
                 return {
                     datum: dateMatch ? dateMatch[1].replace(/\s/g, '') : null,
                     misto: locationMatch ? locationMatch[1].trim() : "Neznámé místo"
@@ -196,7 +188,6 @@
             }
 
             parseRace(block) {
-                // Dynamické získání názvu a parametrů
                 const headerMatch = block.match(/(\d+)\.\s*dostih\s+(\d+)\s*-\s*(.*?)(?=\s\(klusáci|\sklusáci)/);
                 const paramsMatch = block.match(/(\(klusáci.*?\d+\s*Kč\))/);
 
@@ -208,13 +199,12 @@
                     koně: [],
                     vysledky_info: {
                         vyrok_raw: this.extractValue(block, /Výrok:\s*(.*?)(?=\sČas:|$)/),
-                        vyrok_parsed: [], // Bude naplněno níže
+                        vyrok_parsed: [],
                         cas: this.extractValue(block, /Čas:\s*([\d:.]+)/)
                     },
                     sankce: this.extractSankce(block)
                 };
 
-                // Rozparsování výroku na pole
                 if (race.vysledky_info.vyrok_raw) {
                     race.vysledky_info.vyrok_parsed = this.parseVyrok(race.vysledky_info.vyrok_raw);
                 }
@@ -237,38 +227,88 @@
             }
 
             extractHorses(block, race) {
-                const horseRegex = /(\d{4})?\s*\.?\s*([A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ\s']+(?:\([A-Z]+\))?)\s+(\d+)\s+([a-z]{2,5})/g;
+                // 1. Předčištění: Odstraníme balast původu a normalizujeme mezery
+                const cleanBlock = block.replace(/Původ:?\s*.*?Chovatel:?\s*.*?(?=[0-9]{4}|$)/gi, ' ')
+                    .replace(/\s+/g, ' ');
 
-                let match;
-                while ((match = horseRegex.exec(block)) !== null) {
-                    let horse = {
-                        identifikator: match[1] || null,
-                        jmeno: match[2].trim(),
-                        vek: match[3],
-                        pohlavi: match[4],
+                // 2. Extrakce koní - vylepšený regex, který zvládne i "přilepená" čísla na začátku
+                // Skupina 1: ID (nepovinné), Skupina 2: Jméno, Skupina 3: Věk, Skupina 4: Pohlaví
+                const horseRegex = /(?:\d{1,2})?(\d{4})\s+([A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ0-9\s']+(?:\([A-Z]+\))?)\s+(\d+)\s+([a-z]{2,5})/g;
+
+                const horses = [];
+                let hMatch;
+                while ((hMatch = horseRegex.exec(cleanBlock)) !== null) {
+                    horses.push({
+                        identifikator: hMatch[1],
+                        jmeno: hMatch[2].trim(),
+                        vek: hMatch[3],
+                        pohlavi: hMatch[4],
+                        index: hMatch.index,
                         stats: null
-                    };
-
-                    const searchArea = block.substring(match.index, match.index + 400);
-                    const sMatch = searchArea.match(/(\d{2}\.\d)\s+(\d{2}\.\d)\s+(\d{4})\s+(.*?)\s+(\d+)\s+(\d+)\s+(\d+(?:,\d+)?)/);
-
-                    if (sMatch) {
-                        horse.stats = {
-                            km_cas: sMatch[1],
-                            poslednich_500: sMatch[2],
-                            distance: sMatch[3],
-                            jezdec: sMatch[4].trim(),
-                            startovni_cislo: sMatch[5],
-                            poradi: sMatch[6],
-                            kurz: sMatch[7].replace(',', '.')
-                        };
-                    }
-                    if (!race.koně.some(h => h.jmeno === horse.jmeno)) {
-                        race.koně.push(horse);
-                    }
+                    });
                 }
-            }
 
+                // 3. Extrakce statistik - hledáme "kotvy" (dva časy XX.X za sebou a rok/distanci 1640/2140)
+                const allStats = [];
+                // Regex hledá: KM_ČAS (XX.X), 500M (XX.X), DISTANCE (1640/2140) a pak zbytek až po kurz
+                const statsRegex = /(\d{2}\.\d)\s+(\d{2}\.\d)\s+(1640|2140|2640)\s+(.*?)\s+(\d+)\s+(\d+)\s+(\d+(?:,\d+)?)/g;
+
+                let sMatch;
+                while ((sMatch = statsRegex.exec(cleanBlock)) !== null) {
+                    allStats.push({
+                        km_cas: sMatch[1],
+                        poslednich_500: sMatch[2],
+                        distance: sMatch[3],
+                        jezdec: sMatch[4].trim(),
+                        startovni_cislo: sMatch[5],
+                        poradi: sMatch[6],
+                        kurz: sMatch[7].replace(',', '.')
+                    });
+                }
+
+                // 4. Inteligentní párování
+                horses.forEach((horse, i) => {
+                    // A) Prvotní pokus: Shoda startovního čísla (nejspolehlivější)
+                    // Hledáme v allStats takový záznam, kde se startovní číslo vyskytuje v okolí koně
+                    let foundStats = allStats.find(s =>
+                        cleanBlock.substring(horse.index, horse.index + 500).includes(s.startovni_cislo) &&
+                        (s.km_cas.includes('.') || s.poslednich_500.includes('.'))
+                    );
+
+                    // B) Druhý pokus: Párování podle pořadí (pokud jich je stejně)
+                    if (!foundStats && allStats.length === horses.length) {
+                        foundStats = allStats[i];
+                    }
+
+                    // C) Třetí pokus: Hledání v bezprostředním okolí bez ohledu na startovní číslo
+                    if (!foundStats) {
+                        const searchArea = cleanBlock.substring(horse.index, horse.index + 600);
+                        const backupMatch = searchArea.match(/(\d{2}\.\d)\s+(\d{2}\.\d)\s+(1640|2140|2640)\s+(.*?)\s+(\d+)\s+(\d+)\s+(\d+(?:,\d+)?)/);
+                        if (backupMatch) {
+                            foundStats = {
+                                km_cas: backupMatch[1],
+                                poslednich_500: backupMatch[2],
+                                distance: backupMatch[3],
+                                jezdec: backupMatch[4].trim(),
+                                startovni_cislo: backupMatch[5],
+                                poradi: backupMatch[6],
+                                kurz: backupMatch[7].replace(',', '.')
+                            };
+                        }
+                    }
+
+                    if (foundStats) {
+                        horse.stats = foundStats;
+                    }
+
+                    // Odstranění duplicit a uložení
+                    if (!race.koně.some(h => h.jmeno === horse.jmeno)) {
+                        const saveHorse = { ...horse };
+                        delete saveHorse.index;
+                        race.koně.push(saveHorse);
+                    }
+                });
+            }
             extractSankce(block) {
                 const match = block.match(/Sankce\s*:\s*(.*?)(?=Poplatek|Poznámka|Nestartující|Dostihová|$)/);
                 if (!match) return [];
